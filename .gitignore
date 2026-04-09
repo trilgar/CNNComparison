@@ -1,0 +1,5 @@
+models/
+src/__pycache__/
+*.pyc
+.venv/
+training_output.log

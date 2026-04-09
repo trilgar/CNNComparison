@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import kaggle; print\\('kaggle available'\\)\")",
+      "Read(//mnt/c/Users/zarit/PycharmProjects/**)",
+      "Bash(mkdir -p src models results/confusion_matrices results/training_logs results/classification_reports)",
+      "Bash(pip install:*)",
+      "Bash(python:*)",
+      "Bash(kaggle datasets:*)",
+      "Bash(nvidia-smi)"
+    ]
+  }
+}
