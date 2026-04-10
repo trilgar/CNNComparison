@@ -9,8 +9,9 @@ from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from src.config import (
-    DEVICE, NUM_EPOCHS, FREEZE_EPOCHS, LR_HEAD, LR_BACKBONE,
+    DEVICE, NUM_EPOCHS, FREEZE_EPOCHS, HYBRID_FREEZE_EPOCHS, LR_HEAD, LR_BACKBONE,
     WEIGHT_DECAY, EARLY_STOPPING_PATIENCE, MODELS_DIR, RESULTS_DIR,
+    LABEL_SMOOTHING, GRAD_CLIP_MAX_NORM,
 )
 from src.models import freeze_backbone, unfreeze_all
 
@@ -28,7 +29,10 @@ def train_model(model, model_name, param_groups, train_loader, val_loader, class
     """
     model = model.to(DEVICE)
     class_weights = class_weights.to(DEVICE)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
+
+    # Determine freeze duration per model
+    freeze_epochs = HYBRID_FREEZE_EPOCHS if model_name == "Hybrid CNN-Transformer" else FREEZE_EPOCHS
 
     # Phase 1: frozen backbone — train head only
     freeze_backbone(model, model_name)
@@ -50,14 +54,14 @@ def train_model(model, model_name, param_groups, train_loader, val_loader, class
     epoch_bar = tqdm(range(1, NUM_EPOCHS + 1), desc=f"[{model_name}]", unit="epoch")
 
     for epoch in epoch_bar:
-        # Unfreeze after FREEZE_EPOCHS
-        if epoch == FREEZE_EPOCHS + 1:
+        # Unfreeze after freeze_epochs
+        if epoch == freeze_epochs + 1:
             unfreeze_all(model)
             optimizer = AdamW([
                 {"params": param_groups[0], "lr": LR_BACKBONE},
                 {"params": param_groups[1], "lr": LR_HEAD},
             ], weight_decay=WEIGHT_DECAY)
-            scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - FREEZE_EPOCHS)
+            scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS - freeze_epochs)
             tqdm.write(f"  >>> Epoch {epoch}: backbone unfrozen, differential LR active")
 
         # --- Train ---
@@ -82,6 +86,8 @@ def train_model(model, model_name, param_groups, train_loader, val_loader, class
                 loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_MAX_NORM)
             scaler.step(optimizer)
             scaler.update()
 
@@ -123,7 +129,7 @@ def train_model(model, model_name, param_groups, train_loader, val_loader, class
         )
 
         # Print summary line
-        phase = "frozen" if epoch <= FREEZE_EPOCHS else "full"
+        phase = "frozen" if epoch <= freeze_epochs else "full"
         tqdm.write(
             f"  Epoch {epoch:2d}/{NUM_EPOCHS} [{phase:6s}] "
             f"train_loss={train_loss:.4f}  train_acc={train_acc:.4f}  "

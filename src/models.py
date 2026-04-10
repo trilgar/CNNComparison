@@ -6,7 +6,7 @@ from torchvision.models import (
     EfficientNet_B0_Weights, ViT_B_16_Weights,
 )
 
-from src.config import NUM_CLASSES
+from src.config import NUM_CLASSES, HEAD_DROPOUT
 
 
 def get_model(name):
@@ -32,7 +32,10 @@ def get_model(name):
 def _build_resnet50():
     model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
     in_features = model.fc.in_features
-    model.fc = nn.Linear(in_features, NUM_CLASSES)
+    model.fc = nn.Sequential(
+        nn.Dropout(HEAD_DROPOUT),
+        nn.Linear(in_features, NUM_CLASSES),
+    )
 
     backbone_params = [p for n, p in model.named_parameters() if not n.startswith("fc.")]
     head_params = list(model.fc.parameters())
@@ -42,7 +45,10 @@ def _build_resnet50():
 def _build_densenet121():
     model = models.densenet121(weights=DenseNet121_Weights.IMAGENET1K_V1)
     in_features = model.classifier.in_features
-    model.classifier = nn.Linear(in_features, NUM_CLASSES)
+    model.classifier = nn.Sequential(
+        nn.Dropout(HEAD_DROPOUT),
+        nn.Linear(in_features, NUM_CLASSES),
+    )
 
     backbone_params = [p for n, p in model.named_parameters() if not n.startswith("classifier.")]
     head_params = list(model.classifier.parameters())
@@ -52,7 +58,11 @@ def _build_densenet121():
 def _build_efficientnet_b0():
     model = models.efficientnet_b0(weights=EfficientNet_B0_Weights.IMAGENET1K_V1)
     in_features = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(in_features, NUM_CLASSES)
+    # EfficientNet already has dropout at classifier[0]; replace linear with our own
+    model.classifier = nn.Sequential(
+        nn.Dropout(HEAD_DROPOUT),
+        nn.Linear(in_features, NUM_CLASSES),
+    )
 
     backbone_params = [p for n, p in model.named_parameters() if not n.startswith("classifier.")]
     head_params = list(model.classifier.parameters())
@@ -62,7 +72,10 @@ def _build_efficientnet_b0():
 def _build_vit_b16():
     model = models.vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
     in_features = model.heads.head.in_features
-    model.heads.head = nn.Linear(in_features, NUM_CLASSES)
+    model.heads.head = nn.Sequential(
+        nn.Dropout(HEAD_DROPOUT),
+        nn.Linear(in_features, NUM_CLASSES),
+    )
 
     backbone_params = [p for n, p in model.named_parameters() if not n.startswith("heads.")]
     head_params = list(model.heads.parameters())
@@ -70,37 +83,54 @@ def _build_vit_b16():
 
 
 class HybridCNNTransformer(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES, d_model=512, nhead=8, num_layers=4):
+    def __init__(self, num_classes=NUM_CLASSES, d_model=256, nhead=8, num_layers=2):
         super().__init__()
         resnet = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V2)
         self.backbone = nn.Sequential(*list(resnet.children())[:-2])  # B x 2048 x 7 x 7
 
         self.proj = nn.Linear(2048, d_model)
+        self.proj_norm = nn.LayerNorm(d_model)
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, d_model))
-        self.pos_embed = nn.Parameter(torch.randn(1, 50, d_model))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(1, 50, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
             dropout=0.1, activation="gelu", batch_first=True,
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
 
-        self.head = nn.Linear(d_model, num_classes)
+        self.head = nn.Sequential(
+            nn.Dropout(HEAD_DROPOUT),
+            nn.Linear(d_model, num_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.trunc_normal_(self.cls_token, std=0.02)
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        # Init head linear (second element in Sequential)
+        nn.init.xavier_uniform_(self.head[1].weight)
+        nn.init.zeros_(self.head[1].bias)
 
     def forward(self, x):
         features = self.backbone(x)  # B x 2048 x 7 x 7
         B, C, H, W = features.shape
 
         patches = features.flatten(2).transpose(1, 2)  # B x 49 x 2048
-        patches = self.proj(patches)  # B x 49 x d_model
+        patches = self.proj_norm(self.proj(patches))  # B x 49 x d_model
 
         cls = self.cls_token.expand(B, -1, -1)
         tokens = torch.cat([cls, patches], dim=1)  # B x 50 x d_model
         tokens = tokens + self.pos_embed
 
         out = self.transformer(tokens)
-        return self.head(out[:, 0])
+        out = self.norm(out[:, 0])
+        return self.head(out)
 
 
 def _build_hybrid():
